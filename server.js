@@ -146,7 +146,7 @@ app.get("/oauth/google/callback", async (req, res) => {
        VALUES ($1,'google',$2,$3,to_timestamp($4/1000),$5, now(), now())
        ON CONFLICT (user_id, provider)
        DO UPDATE SET access_token = EXCLUDED.access_token,
-                     refresh_token = COALESDED(EXCLUDED.refresh_token, oauth_tokens.refresh_token),
+                     refresh_token = COALESCE(EXCLUDED.refresh_token, oauth_tokens.refresh_token),
                      expiry = EXCLUDED.expiry,
                      scope = EXCLUDED.scope,
                      updated_at = now()`,
