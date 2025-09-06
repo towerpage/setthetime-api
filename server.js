@@ -5,7 +5,11 @@ const { ServerClient } = require("postmark");
 const { google } = require("googleapis");
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: ['https://app.setthetime.com', 'https://link.setthetime.com'],
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type']
+}));
 app.use(express.json());
 
 /* =========================
