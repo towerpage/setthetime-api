@@ -14,7 +14,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: true }
 });
 
-// ------- Email (queue now; send later) -------
+// ------- Email (queue now; send later when Postmark is approved) -------
 const postmarkToken = process.env.POSTMARK_TOKEN || "";
 const postmark = postmarkToken ? new ServerClient(postmarkToken) : null;
 const mailMode = process.env.MAIL_MODE || "queue"; // 'queue' until Postmark is approved
@@ -67,7 +67,7 @@ function makeOAuth() {
 }
 const SCOPES = ["https://www.googleapis.com/auth/calendar"];
 
-// ------- Basic health -------
+// ------- Health -------
 app.get("/health", (_req, res) => res.type("text/plain").send("OK"));
 app.get("/", (_req, res) => res.type("text/plain").send("OK"));
 
@@ -138,19 +138,19 @@ app.get("/oauth/google/callback", async (req, res) => {
     const { tokens } = await oauth2.getToken(code);
 
     const userId = process.env.TEST_USER_ID;
-    const expiryMs = tokens.expiry_date || (Date.now() + 3600 * 1000);
+    const expiryIso = new Date(tokens.expiry_date ?? (Date.now() + 3600 * 1000)).toISOString();
     const scopeStr = (tokens.scope && String(tokens.scope)) || SCOPES.join(" ");
 
     await pool.query(
       `INSERT INTO oauth_tokens (user_id, provider, access_token, refresh_token, expiry, scope, created_at, updated_at)
-       VALUES ($1,'google',$2,$3,to_timestamp($4/1000),$5, now(), now())
+       VALUES ($1,'google',$2,$3,$4::timestamptz,$5, now(), now())
        ON CONFLICT (user_id, provider)
        DO UPDATE SET access_token = EXCLUDED.access_token,
                      refresh_token = COALESCE(EXCLUDED.refresh_token, oauth_tokens.refresh_token),
                      expiry = EXCLUDED.expiry,
                      scope = EXCLUDED.scope,
                      updated_at = now()`,
-      [userId, tokens.access_token, tokens.refresh_token || null, expiryMs, scopeStr]
+      [userId, tokens.access_token, tokens.refresh_token || null, expiryIso, scopeStr]
     );
 
     res.type("text/plain").send("Google connected");
