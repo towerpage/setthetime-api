@@ -8,16 +8,20 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ------- Database (Neon) -------
+/* =========================
+   Database (Neon / Postgres)
+   ========================= */
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: true }
+  ssl: { rejectUnauthorized: true },
 });
 
-// ------- Email (queue now; send later when Postmark is approved) -------
+/* =========================
+   Email (Postmark, queued until approval)
+   ========================= */
 const postmarkToken = process.env.POSTMARK_TOKEN || "";
 const postmark = postmarkToken ? new ServerClient(postmarkToken) : null;
-const mailMode = process.env.MAIL_MODE || "queue"; // 'queue' until Postmark is approved
+const mailMode = process.env.MAIL_MODE || "queue"; // 'queue' or 'send'
 
 async function queueEmail({ to, from, subject, text, html, payload }) {
   const q = `
@@ -25,7 +29,14 @@ async function queueEmail({ to, from, subject, text, html, payload }) {
     VALUES ($1,$2,$3,$4,$5,$6,'queued')
     RETURNING id
   `;
-  const { rows } = await pool.query(q, [to, from, subject, text || null, html || null, payload || null]);
+  const { rows } = await pool.query(q, [
+    to,
+    from,
+    subject,
+    text || null,
+    html || null,
+    payload || null,
+  ]);
   return rows[0].id;
 }
 
@@ -37,13 +48,13 @@ async function sendViaPostmark({ to, from, subject, text, html }) {
     Subject: subject,
     TextBody: text || undefined,
     HtmlBody: html || undefined,
-    MessageStream: "outbound"
+    MessageStream: "outbound",
   });
   return result.MessageID;
 }
 
 async function sendEmail({ to, from, subject, text, html, payload }) {
-  const useQueue = (mailMode === "queue") || !postmark;
+  const useQueue = mailMode === "queue" || !postmark;
   if (useQueue) {
     const id = await queueEmail({ to, from, subject, text, html, payload });
     return { queued: true, id };
@@ -57,7 +68,9 @@ async function sendEmail({ to, from, subject, text, html, payload }) {
   return { queued: false, messageID };
 }
 
-// ------- Google OAuth (for Calendar) -------
+/* =========================
+   Google OAuth (Calendar)
+   ========================= */
 function makeOAuth() {
   return new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
@@ -67,11 +80,58 @@ function makeOAuth() {
 }
 const SCOPES = ["https://www.googleapis.com/auth/calendar"];
 
-// ------- Health -------
+/* Build OAuth client for a user and auto-persist refreshed tokens */
+async function getGoogleAuthForUser(userId) {
+  const { rows } = await pool.query(
+    "SELECT access_token, refresh_token, expiry FROM oauth_tokens WHERE user_id=$1 AND provider='google'",
+    [userId]
+  );
+  if (!rows.length) throw new Error("Google not connected for user");
+  const row = rows[0];
+
+  const oauth2 = makeOAuth();
+  oauth2.setCredentials({
+    access_token: row.access_token,
+    refresh_token: row.refresh_token || undefined,
+    expiry_date: row.expiry ? new Date(row.expiry).getTime() : undefined,
+  });
+
+  oauth2.on("tokens", async (tokens) => {
+    try {
+      const expiryIso = tokens.expiry_date
+        ? new Date(tokens.expiry_date).toISOString()
+        : null;
+      await pool.query(
+        `UPDATE oauth_tokens
+           SET access_token = COALESCE($1, access_token),
+               refresh_token = COALESCE($2, refresh_token),
+               expiry = COALESCE($3::timestamptz, expiry),
+               updated_at = now()
+         WHERE user_id=$4 AND provider='google'`,
+        [
+          tokens.access_token || null,
+          tokens.refresh_token || null,
+          expiryIso,
+          userId,
+        ]
+      );
+    } catch {
+      /* ignore refresh persist errors */
+    }
+  });
+
+  return oauth2;
+}
+
+/* =========================
+   Basic health
+   ========================= */
 app.get("/health", (_req, res) => res.type("text/plain").send("OK"));
 app.get("/", (_req, res) => res.type("text/plain").send("OK"));
 
-// ------- Email test (queues while awaiting Postmark approval) -------
+/* =========================
+   Email test + outbox debug
+   ========================= */
 app.get("/send-test", async (req, res) => {
   try {
     const to = req.query.to;
@@ -81,7 +141,7 @@ app.get("/send-test", async (req, res) => {
       from: "noreply@setthetime.com",
       subject: "Setthetime test",
       text: "This is a test from the Render API (queued until Postmark is approved).",
-      payload: { kind: "test" }
+      payload: { kind: "test" },
     });
     res.json({ ok: true, ...result });
   } catch (e) {
@@ -89,7 +149,6 @@ app.get("/send-test", async (req, res) => {
   }
 });
 
-// ------- Outbox debug -------
 app.get("/debug/outbox", async (_req, res) => {
   const { rows } = await pool.query(
     "SELECT id, to_email, subject, status, created_at FROM email_outbox ORDER BY id DESC LIMIT 20"
@@ -99,9 +158,16 @@ app.get("/debug/outbox", async (_req, res) => {
 
 app.post("/debug/flush/:id", async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT * FROM email_outbox WHERE id=$1 AND status='queued'", [req.params.id]);
-    if (!rows.length) return res.status(404).json({ ok: false, error: "not found or not queued" });
-    if (!postmark) return res.status(400).json({ ok: false, error: "Postmark not available yet" });
+    const { rows } = await pool.query(
+      "SELECT * FROM email_outbox WHERE id=$1 AND status='queued'",
+      [req.params.id]
+    );
+    if (!rows.length)
+      return res.status(404).json({ ok: false, error: "not found or not queued" });
+    if (!postmark)
+      return res
+        .status(400)
+        .json({ ok: false, error: "Postmark not available yet" });
 
     const row = rows[0];
     const messageID = await sendViaPostmark({
@@ -109,22 +175,27 @@ app.post("/debug/flush/:id", async (req, res) => {
       from: row.from_email,
       subject: row.subject,
       text: row.text_body,
-      html: row.html_body
+      html: row.html_body,
     });
-    await pool.query("UPDATE email_outbox SET status='sent', sent_at=now() WHERE id=$1", [row.id]);
+    await pool.query(
+      "UPDATE email_outbox SET status='sent', sent_at=now() WHERE id=$1",
+      [row.id]
+    );
     res.json({ ok: true, messageID });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ------- Google OAuth routes -------
+/* =========================
+   Google OAuth routes
+   ========================= */
 app.get("/oauth/google/start", (_req, res) => {
   const oauth2 = makeOAuth();
   const url = oauth2.generateAuthUrl({
     access_type: "offline",
     prompt: "consent",
-    scope: SCOPES
+    scope: SCOPES,
   });
   res.redirect(url);
 });
@@ -138,8 +209,11 @@ app.get("/oauth/google/callback", async (req, res) => {
     const { tokens } = await oauth2.getToken(code);
 
     const userId = process.env.TEST_USER_ID;
-    const expiryIso = new Date(tokens.expiry_date ?? (Date.now() + 3600 * 1000)).toISOString();
-    const scopeStr = (tokens.scope && String(tokens.scope)) || SCOPES.join(" ");
+    const expiryIso = new Date(
+      tokens.expiry_date ?? Date.now() + 3600 * 1000
+    ).toISOString();
+    const scopeStr =
+      (tokens.scope && String(tokens.scope)) || SCOPES.join(" ");
 
     await pool.query(
       `INSERT INTO oauth_tokens (user_id, provider, access_token, refresh_token, expiry, scope, created_at, updated_at)
@@ -150,7 +224,13 @@ app.get("/oauth/google/callback", async (req, res) => {
                      expiry = EXCLUDED.expiry,
                      scope = EXCLUDED.scope,
                      updated_at = now()`,
-      [userId, tokens.access_token, tokens.refresh_token || null, expiryIso, scopeStr]
+      [
+        userId,
+        tokens.access_token,
+        tokens.refresh_token || null,
+        expiryIso,
+        scopeStr,
+      ]
     );
 
     res.type("text/plain").send("Google connected");
@@ -166,8 +246,101 @@ app.get("/oauth/google/status", async (_req, res) => {
     [userId]
   );
   if (!rows.length) return res.json({ connected: false });
-  return res.json({ connected: true, expiry: rows[0].expiry, updated_at: rows[0].updated_at });
+  return res.json({
+    connected: true,
+    expiry: rows[0].expiry,
+    updated_at: rows[0].updated_at,
+  });
 });
 
+/* =========================
+   Availability (reads Google Calendar busy times)
+   ========================= */
+function overlaps(aStart, aEnd, bStart, bEnd) {
+  return aStart < bEnd && bStart < aEnd;
+}
+
+// GET /availability?meetingTypeId=...&from=ISO&to=ISO
+app.get("/availability", async (req, res) => {
+  try {
+    const meetingTypeId = req.query.meetingTypeId;
+    const fromIso = req.query.from;
+    const toIso = req.query.to;
+
+    if (!meetingTypeId || !fromIso || !toIso) {
+      return res
+        .status(400)
+        .json({ error: "missing meetingTypeId, from, or to" });
+    }
+
+    // Load meeting type
+    const mtQ = await pool.query(
+      "SELECT user_id, duration_minutes, timezone FROM meeting_types WHERE id=$1",
+      [meetingTypeId]
+    );
+    if (!mtQ.rows.length)
+      return res.status(404).json({ error: "meeting type not found" });
+
+    const mt = mtQ.rows[0];
+    const userId = mt.user_id;
+
+    // Google Calendar free/busy
+    const auth = await getGoogleAuthForUser(userId);
+    const calendar = google.calendar({ version: "v3", auth });
+
+    const timeMin = new Date(fromIso).toISOString();
+    const timeMax = new Date(toIso).toISOString();
+
+    const fb = await calendar.freebusy.query({
+      requestBody: { timeMin, timeMax, items: [{ id: "primary" }] },
+    });
+
+    const busy = (fb.data.calendars?.primary?.busy || []).map((b) => ({
+      start: new Date(b.start),
+      end: new Date(b.end),
+    }));
+
+    // Candidate slots on duration increments
+    const durMin = Number(mt.duration_minutes);
+    const stepMs = durMin * 60 * 1000;
+    const startMs = new Date(timeMin).getTime();
+    const endMs = new Date(timeMax).getTime();
+
+    const slots = [];
+    for (let t = startMs; t + stepMs <= endMs; t += stepMs) {
+      const slotStart = new Date(t);
+      const slotEnd = new Date(t + stepMs);
+
+      let conflict = false;
+      for (const b of busy) {
+        if (overlaps(slotStart, slotEnd, b.start, b.end)) {
+          conflict = true;
+          break;
+        }
+      }
+      if (!conflict) {
+        slots.push({
+          start: slotStart.toISOString(),
+          end: slotEnd.toISOString(),
+        });
+      }
+    }
+
+    res.json({
+      meetingTypeId,
+      timeMin,
+      timeMax,
+      durationMinutes: durMin,
+      slots,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* =========================
+   Start server
+   ========================= */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API listening on ${PORT}`));
+
