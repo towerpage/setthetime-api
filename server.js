@@ -206,15 +206,17 @@ app.get("/oauth/google/start", (_req, res) => {
 
 app.get("/oauth/google/callback", async (req, res) => {
   try {
+    const appBase = process.env.APP_BASE_URL || 'https://app.setthetime.com';
+
     const code = req.query.code;
-    if (!code) return res.status(400).type("text/plain").send("Missing code");
+    if (!code) return res.redirect(`${appBase}?error=Missing%20code`);
 
     const oauth2 = makeOAuth();
     const { tokens } = await oauth2.getToken(code);
 
     const userId = process.env.TEST_USER_ID;
     const expiryIso = new Date(
-      tokens.expiry_date ?? Date.now() + 3600 * 1000
+      tokens.expiry_date ?? (Date.now() + 3600 * 1000)
     ).toISOString();
     const scopeStr =
       (tokens.scope && String(tokens.scope)) || SCOPES.join(" ");
@@ -237,9 +239,10 @@ app.get("/oauth/google/callback", async (req, res) => {
       ]
     );
 
-    res.type("text/plain").send("Google connected");
+    return res.redirect(`${appBase}?connected=1`);
   } catch (e) {
-    res.status(500).type("text/plain").send(`OAuth error: ${e.message}`);
+    const appBase = process.env.APP_BASE_URL || 'https://app.setthetime.com';
+    return res.redirect(`${appBase}?error=${encodeURIComponent(e.message)}`);
   }
 });
 
@@ -341,7 +344,6 @@ app.get("/availability", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-
 
 /* =========================
    Booking (chosen slot creates a Calendar event, stores it in Postgres, and queues emails)
@@ -447,10 +449,8 @@ app.post("/book", async (req, res) => {
   }
 });
 
-
 /* =========================
    Start server
    ========================= */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API listening on ${PORT}`));
-
