@@ -133,7 +133,10 @@ app.get("/send-test", async (req, res) => {
 
 app.get("/debug/outbox", async (_req, res) => {
   const { rows } = await pool.query(
-    "SELECT id, to_email, subject, status, created_at FROM email_outbox ORDER BY id DESC LIMIT 20"
+    `SELECT id, to_email, from_email, subject, status, created_at
+       FROM email_outbox
+      ORDER BY id DESC
+      LIMIT 20`
   );
   res.json(rows);
 });
