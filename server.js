@@ -3,14 +3,24 @@ const cors = require("cors");
 const { Pool } = require("pg");
 const { ServerClient } = require("postmark");
 const { google } = require("googleapis");
+const crypto = require("crypto");
 
 const app = express();
+app.set("trust proxy", 1);
 app.use(cors({
   origin: ['https://app.setthetime.com', 'https://link.setthetime.com'],
   methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type']
+  allowedHeaders: ['Content-Type','Authorization'],
+  credentials: true
 }));
 app.use(express.json());
+
+/* =========================
+   Env
+   ========================= */
+const APP_BASE = process.env.APP_BASE_URL || 'https://app.setthetime.com';
+const FROM_EMAIL = process.env.FROM_EMAIL || "service@setthetime.com";
+const SESSION_SECRET = process.env.SESSION_SECRET || "CHANGE_ME";
 
 /* =========================
    Database (Neon / Postgres)
@@ -21,7 +31,7 @@ const pool = new Pool({
 });
 
 /* =========================
-   Email (Postmark, queued until approval)
+   Email (Postmark; queue until approved)
    ========================= */
 const postmarkToken = process.env.POSTMARK_TOKEN || "";
 const postmark = postmarkToken ? new ServerClient(postmarkToken) : null;
@@ -33,12 +43,9 @@ async function queueEmail({ to, from, subject, text, html, payload }) {
     VALUES ($1,$2,$3,$4,$5,$6,'queued')
     RETURNING id
   `;
-  const { rows } = await pool.query(q, [
-    to, from, subject, text || null, html || null, payload || null,
-  ]);
+  const { rows } = await pool.query(q, [to, from, subject, text || null, html || null, payload || null]);
   return rows[0].id;
 }
-
 async function sendViaPostmark({ to, from, subject, text, html }) {
   if (!postmark) throw new Error("Postmark not available");
   const result = await postmark.sendEmail({
@@ -48,7 +55,6 @@ async function sendViaPostmark({ to, from, subject, text, html }) {
   });
   return result.MessageID;
 }
-
 async function sendEmail({ to, from, subject, text, html, payload }) {
   const useQueue = mailMode === "queue" || !postmark;
   if (useQueue) {
@@ -65,8 +71,49 @@ async function sendEmail({ to, from, subject, text, html, payload }) {
 }
 
 /* =========================
-   Google OAuth (Calendar)
+   Stateless sessions (signed token)
    ========================= */
+function b64url(buf) {
+  return Buffer.from(buf).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+function signToken(payloadObj, maxAgeSec = 30 * 24 * 3600) { // 30d
+  const payload = { ...payloadObj, exp: Math.floor(Date.now()/1000) + maxAgeSec };
+  const body = b64url(JSON.stringify(payload));
+  const sig = b64url(crypto.createHmac('sha256', SESSION_SECRET).update(body).digest());
+  return `${body}.${sig}`;
+}
+function verifyToken(token) {
+  if (!token || !token.includes('.')) return null;
+  const [body, sig] = token.split('.');
+  const expected = b64url(crypto.createHmac('sha256', SESSION_SECRET).update(body).digest());
+  if (sig !== expected) return null;
+  let payload;
+  try { payload = JSON.parse(Buffer.from(body, 'base64').toString('utf8')); } catch { return null; }
+  if (!payload.exp || payload.exp < Math.floor(Date.now()/1000)) return null;
+  return payload;
+}
+function getAuthUserId(req) {
+  const h = req.headers['authorization'] || '';
+  const m = /^Bearer (.+)$/.exec(Array.isArray(h) ? h[0] : h);
+  if (!m) return null;
+  const p = verifyToken(m[1]);
+  return p?.uid || null;
+}
+function requireAuth(req, res, next) {
+  const uid = getAuthUserId(req);
+  if (!uid) return res.status(401).json({ ok:false, error: 'unauthorized' });
+  req.userId = uid;
+  next();
+}
+
+/* =========================
+   Google OAuth (Login + Calendar)
+   ========================= */
+const SCOPES = [
+  "openid", "email", "profile",
+  "https://www.googleapis.com/auth/calendar"
+];
+
 function makeOAuth() {
   return new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
@@ -74,8 +121,6 @@ function makeOAuth() {
     process.env.GOOGLE_REDIRECT_URI
   );
 }
-const SCOPES = ["https://www.googleapis.com/auth/calendar"];
-
 async function getGoogleAuthForUser(userId) {
   const { rows } = await pool.query(
     "SELECT access_token, refresh_token, expiry FROM oauth_tokens WHERE user_id=$1 AND provider='google'",
@@ -83,14 +128,12 @@ async function getGoogleAuthForUser(userId) {
   );
   if (!rows.length) throw new Error("Google not connected for user");
   const row = rows[0];
-
   const oauth2 = makeOAuth();
   oauth2.setCredentials({
     access_token: row.access_token,
     refresh_token: row.refresh_token || undefined,
     expiry_date: row.expiry ? new Date(row.expiry).getTime() : undefined,
   });
-
   oauth2.on("tokens", async (tokens) => {
     try {
       const expiryIso = tokens.expiry_date ? new Date(tokens.expiry_date).toISOString() : null;
@@ -105,7 +148,6 @@ async function getGoogleAuthForUser(userId) {
       );
     } catch {}
   });
-
   return oauth2;
 }
 
@@ -123,7 +165,7 @@ app.get("/send-test", async (req, res) => {
     const to = req.query.to;
     if (!to) return res.status(400).json({ ok: false, error: "missing ?to=" });
     const result = await sendEmail({
-      to, from: "service@setthetime.com", subject: "Setthetime test",
+      to, from: FROM_EMAIL, subject: "Setthetime test",
       text: "This is a test from the Render API (queued until Postmark is approved).",
       payload: { kind: "test" },
     });
@@ -161,27 +203,109 @@ app.post("/debug/flush/:id", async (req, res) => {
 });
 
 /* =========================
-   Google OAuth routes
+   Auth: signup + session
+   ========================= */
+// POST /signup  { email, name?, timezone? }  -> { ok, userId, token, loginUrl }
+app.post("/signup", async (req, res) => {
+  try {
+    const { email, name, timezone } = req.body || {};
+    if (!email) return res.status(400).json({ ok:false, error: "missing email" });
+
+    // ensure user exists
+    let userId;
+    const u1 = await pool.query("SELECT id FROM users WHERE email=$1 LIMIT 1", [email]);
+    if (u1.rows.length) {
+      userId = u1.rows[0].id;
+      if (name) await pool.query("UPDATE users SET name=$1 WHERE id=$2", [name, userId]);
+      if (timezone) await pool.query("UPDATE users SET timezone=$1 WHERE id=$2", [timezone, userId]);
+    } else {
+      const u2 = await pool.query(
+        "INSERT INTO users (email, name, timezone) VALUES ($1,$2,$3) RETURNING id",
+        [email, name || null, timezone || null]
+      );
+      userId = u2.rows[0].id;
+    }
+
+    // issue short-lived login token (15 min)
+    const linkToken = signToken({ uid: userId, kind: "link" }, 15 * 60);
+    const loginUrl = `${APP_BASE}?token=${encodeURIComponent(linkToken)}`;
+
+    // queue magic-link email
+    await sendEmail({
+      to: email, from: FROM_EMAIL,
+      subject: "Your setthetime sign-in link",
+      text: `Click to sign in: ${loginUrl}`
+    });
+
+    return res.json({ ok:true, userId, token: linkToken, loginUrl });
+  } catch (e) { return res.status(500).json({ ok:false, error: e.message }); }
+});
+
+// POST /session/consume { token } -> { ok, userId, token }
+app.post("/session/consume", async (req, res) => {
+  try {
+    const { token } = req.body || {};
+    const p = verifyToken(token);
+    if (!p?.uid) return res.status(400).json({ ok:false, error: "invalid token" });
+    // issue 30-day session
+    const session = signToken({ uid: p.uid, kind: "session" }, 30 * 24 * 3600);
+    return res.json({ ok:true, userId: p.uid, token: session });
+  } catch (e) { return res.status(500).json({ ok:false, error: e.message }); }
+});
+
+// Who am I?  -> { signedIn, userId? }
+app.get("/auth/me", (req, res) => {
+  const uid = getAuthUserId(req);
+  if (!uid) return res.json({ signedIn: false });
+  res.json({ signedIn: true, userId: uid });
+});
+
+/* =========================
+   Google OAuth routes (login + calendar connect)
    ========================= */
 app.get("/oauth/google/start", (_req, res) => {
   const oauth2 = makeOAuth();
-  const url = oauth2.generateAuthUrl({ access_type: "offline", prompt: "consent", scope: SCOPES });
+  const url = oauth2.generateAuthUrl({
+    access_type: "offline",
+    prompt: "consent",
+    scope: SCOPES
+  });
   res.redirect(url);
 });
 
 app.get("/oauth/google/callback", async (req, res) => {
   try {
-    const appBase = process.env.APP_BASE_URL || 'https://app.setthetime.com';
     const code = req.query.code;
-    if (!code) return res.redirect(`${appBase}?error=Missing%20code`);
+    if (!code) return res.redirect(`${APP_BASE}?error=Missing%20code`);
 
     const oauth2 = makeOAuth();
     const { tokens } = await oauth2.getToken(code);
 
-    const userId = process.env.TEST_USER_ID;
+    // identify the Google user (login)
+    if (!tokens.id_token) return res.redirect(`${APP_BASE}?error=Missing%20id_token`);
+    const ticket = await oauth2.verifyIdToken({
+      idToken: tokens.id_token,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload() || {};
+    const email = payload.email;
+    const name = payload.name || email || 'User';
+    if (!email) return res.redirect(`${APP_BASE}?error=No%20email`);
+
+    // upsert user
+    let userId;
+    const u1 = await pool.query("SELECT id FROM users WHERE email=$1 LIMIT 1", [email]);
+    if (u1.rows.length) {
+      userId = u1.rows[0].id;
+      await pool.query("UPDATE users SET name=COALESCE($1,name) WHERE id=$2", [name, userId]);
+    } else {
+      const u2 = await pool.query("INSERT INTO users (email, name) VALUES ($1,$2) RETURNING id", [email, name]);
+      userId = u2.rows[0].id;
+    }
+
+    // store Calendar tokens
     const expiryIso = new Date(tokens.expiry_date ?? (Date.now() + 3600 * 1000)).toISOString();
     const scopeStr = (tokens.scope && String(tokens.scope)) || SCOPES.join(" ");
-
     await pool.query(
       `INSERT INTO oauth_tokens (user_id, provider, access_token, refresh_token, expiry, scope, created_at, updated_at)
        VALUES ($1,'google',$2,$3,$4::timestamptz,$5, now(), now())
@@ -194,31 +318,29 @@ app.get("/oauth/google/callback", async (req, res) => {
       [userId, tokens.access_token, tokens.refresh_token || null, expiryIso, scopeStr]
     );
 
-    return res.redirect(`${appBase}?connected=1`);
+    // issue session and return to app
+    const session = signToken({ uid: userId, kind: "session" }, 30 * 24 * 3600);
+    return res.redirect(`${APP_BASE}?token=${encodeURIComponent(session)}&connected=1`);
   } catch (e) {
-    const appBase = process.env.APP_BASE_URL || 'https://app.setthetime.com';
-    return res.redirect(`${appBase}?error=${encodeURIComponent(e.message)}`);
+    return res.redirect(`${APP_BASE}?error=${encodeURIComponent(e.message)}`);
   }
 });
 
-app.get("/oauth/google/status", async (_req, res) => {
-  const userId = process.env.TEST_USER_ID;
+// Calendar token status for the signed-in user
+app.get("/oauth/google/status", requireAuth, async (req, res) => {
   const { rows } = await pool.query(
     "SELECT provider, expiry, updated_at FROM oauth_tokens WHERE user_id=$1 AND provider='google'",
-    [userId]
+    [req.userId]
   );
   if (!rows.length) return res.json({ connected: false });
   return res.json({ connected: true, expiry: rows[0].expiry, updated_at: rows[0].updated_at });
 });
 
 /* =========================
-   Meeting Types (create/list)
+   Meeting Types (create/list) — per signed-in user
    ========================= */
-// POST /meeting-types  { title, duration_minutes, timezone }
-// Returns: { ok, id }
-app.post("/meeting-types", async (req, res) => {
+app.post("/meeting-types", requireAuth, async (req, res) => {
   try {
-    const userId = process.env.TEST_USER_ID;
     const { title, duration_minutes, timezone } = req.body || {};
     if (!title || !duration_minutes) {
       return res.status(400).json({ ok: false, error: "missing title or duration_minutes" });
@@ -231,30 +353,28 @@ app.post("/meeting-types", async (req, res) => {
     const { rows } = await pool.query(
       `INSERT INTO meeting_types (user_id, title, duration_minutes, timezone)
        VALUES ($1,$2,$3,$4) RETURNING id`,
-      [userId, title, dur, tz]
+      [req.userId, title, dur, tz]
     );
     return res.json({ ok: true, id: rows[0].id });
   } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
-// GET /meeting-types  -> list for current user
-app.get("/meeting-types", async (_req, res) => {
+app.get("/meeting-types", requireAuth, async (req, res) => {
   try {
-    const userId = process.env.TEST_USER_ID;
     const { rows } = await pool.query(
       `SELECT id, title, duration_minutes, timezone, created_at
          FROM meeting_types
         WHERE user_id=$1
         ORDER BY created_at DESC
         LIMIT 50`,
-      [userId]
+      [req.userId]
     );
     return res.json({ ok: true, items: rows });
   } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
 /* =========================
-   Availability (Google Free/Busy)
+   Availability (public, by meetingTypeId -> host)
    ========================= */
 function overlaps(aStart, aEnd, bStart, bEnd) { return aStart < bEnd && bStart < aEnd; }
 
@@ -309,7 +429,7 @@ app.get("/availability", async (req, res) => {
 });
 
 /* =========================
-   Booking
+   Booking (public)
    ========================= */
 app.post("/book", async (req, res) => {
   try {
@@ -335,6 +455,7 @@ app.post("/book", async (req, res) => {
     const startIso = start.toISOString();
     const endIso = end.toISOString();
 
+    // Double-check busy
     const auth = await getGoogleAuthForUser(mt.user_id);
     const calendar = google.calendar({ version: "v3", auth });
     const fb = await calendar.freebusy.query({
@@ -343,6 +464,7 @@ app.post("/book", async (req, res) => {
     const busy = fb.data.calendars?.primary?.busy || [];
     if (busy.length > 0) return res.status(409).json({ ok: false, error: "slot not available (calendar busy)" });
 
+    // Check local overlap
     const overlapQ = await pool.query(
       `SELECT 1
          FROM bookings b
@@ -355,6 +477,7 @@ app.post("/book", async (req, res) => {
     );
     if (overlapQ.rows.length) return res.status(409).json({ ok: false, error: "slot not available (existing booking)" });
 
+    // Calendar event
     const eventResp = await calendar.events.insert({
       calendarId: "primary",
       requestBody: {
@@ -367,6 +490,7 @@ app.post("/book", async (req, res) => {
     });
     const eventId = eventResp.data.id;
 
+    // Save booking
     const insertQ = await pool.query(
       `INSERT INTO bookings (meeting_type_id, recipient_name, recipient_email, start_time, end_time, status)
        VALUES ($1,$2,$3,$4,$5,'confirmed') RETURNING id`,
@@ -374,13 +498,14 @@ app.post("/book", async (req, res) => {
     );
     const bookingId = insertQ.rows[0].id;
 
+    // Emails (queued until send enabled)
     await sendEmail({
-      to: recipient_email, from: "service@setthetime.com",
+      to: recipient_email, from: FROM_EMAIL,
       subject: `Confirmed: ${mt.title}`,
       text: `You're booked with ${hostEmail} from ${startIso} to ${endIso} (UTC).\nEvent: ${eventId}`
     });
     await sendEmail({
-      to: hostEmail, from: "service@setthetime.com",
+      to: hostEmail, from: FROM_EMAIL,
       subject: `New booking: ${mt.title}`,
       text: `${recipient_name} <${recipient_email}> booked ${startIso}–${endIso} (UTC).\nEvent: ${eventId}`
     });
