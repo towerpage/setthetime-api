@@ -270,7 +270,8 @@ app.get("/oauth/google/start", (_req, res) => {
   const oauth2 = makeOAuth();
   const url = oauth2.generateAuthUrl({
     access_type: "offline",
-    prompt: "consent",
+    prompt: "consent select_account",
+    include_granted_scopes: false,
     scope: SCOPES
   });
   res.redirect(url);
