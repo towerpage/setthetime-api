@@ -110,8 +110,11 @@ function requireAuth(req, res, next) {
    Google OAuth (Login + Calendar)
    ========================= */
 const SCOPES = [
-  "openid", "email", "profile",
-  "https://www.googleapis.com/auth/calendar"
+  "openid",
+  "email",
+  "profile",
+  "https://www.googleapis.com/auth/calendar.readonly",
+  "https://www.googleapis.com/auth/calendar.events"
 ];
 
 function makeOAuth() {
