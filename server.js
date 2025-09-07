@@ -123,7 +123,7 @@ app.get("/send-test", async (req, res) => {
     const to = req.query.to;
     if (!to) return res.status(400).json({ ok: false, error: "missing ?to=" });
     const result = await sendEmail({
-      to, from: "noreply@setthetime.com", subject: "Setthetime test",
+      to, from: "service@setthetime.com", subject: "Setthetime test",
       text: "This is a test from the Render API (queued until Postmark is approved).",
       payload: { kind: "test" },
     });
@@ -372,12 +372,12 @@ app.post("/book", async (req, res) => {
     const bookingId = insertQ.rows[0].id;
 
     await sendEmail({
-      to: recipient_email, from: "noreply@setthetime.com",
+      to: recipient_email, from: "service@setthetime.com",
       subject: `Confirmed: ${mt.title}`,
       text: `You're booked with ${hostEmail} from ${startIso} to ${endIso} (UTC).\nEvent: ${eventId}`
     });
     await sendEmail({
-      to: hostEmail, from: "noreply@setthetime.com",
+      to: hostEmail, from: "service@setthetime.com",
       subject: `New booking: ${mt.title}`,
       text: `${recipient_name} <${recipient_email}> booked ${startIso}–${endIso} (UTC).\nEvent: ${eventId}`
     });
