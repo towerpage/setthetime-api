@@ -435,6 +435,9 @@ app.get("/availability", async (req, res) => {
 /* =========================
    Booking (public)
    ========================= */
+/* =========================
+   Booking
+   ========================= */
 app.post("/book", async (req, res) => {
   try {
     const { meetingTypeId, recipient_name, recipient_email, start_time } = req.body;
@@ -459,7 +462,7 @@ app.post("/book", async (req, res) => {
     const startIso = start.toISOString();
     const endIso = end.toISOString();
 
-    // Double-check busy
+    // Double-check busy in Google
     const auth = await getGoogleAuthForUser(mt.user_id);
     const calendar = google.calendar({ version: "v3", auth });
     const fb = await calendar.freebusy.query({
@@ -468,7 +471,7 @@ app.post("/book", async (req, res) => {
     const busy = fb.data.calendars?.primary?.busy || [];
     if (busy.length > 0) return res.status(409).json({ ok: false, error: "slot not available (calendar busy)" });
 
-    // Check local overlap
+    // Check local bookings overlap
     const overlapQ = await pool.query(
       `SELECT 1
          FROM bookings b
@@ -481,20 +484,22 @@ app.post("/book", async (req, res) => {
     );
     if (overlapQ.rows.length) return res.status(409).json({ ok: false, error: "slot not available (existing booking)" });
 
-    // Calendar event
+    // Calendar event — **send Google invites automatically**
     const eventResp = await calendar.events.insert({
       calendarId: "primary",
+      sendUpdates: "all", // <-- ADD THIS LINE
       requestBody: {
         summary: `${mt.title} with ${recipient_name}`,
         description: `Booked via setthetime.com`,
-        start: { dateTime: startIso }, end: { dateTime: endIso },
+        start: { dateTime: startIso },
+        end:   { dateTime: endIso },
         attendees: [{ email: hostEmail }, { email: recipient_email }],
         reminders: { useDefault: true }
       }
     });
     const eventId = eventResp.data.id;
 
-    // Save booking
+    // Store booking
     const insertQ = await pool.query(
       `INSERT INTO bookings (meeting_type_id, recipient_name, recipient_email, start_time, end_time, status)
        VALUES ($1,$2,$3,$4,$5,'confirmed') RETURNING id`,
@@ -502,21 +507,24 @@ app.post("/book", async (req, res) => {
     );
     const bookingId = insertQ.rows[0].id;
 
-    // Emails (queued until send enabled)
+    // Queue our own confirmations (Google already sent the invite)
     await sendEmail({
-      to: recipient_email, from: FROM_EMAIL,
+      to: recipient_email, from: "service@setthetime.com",
       subject: `Confirmed: ${mt.title}`,
       text: `You're booked with ${hostEmail} from ${startIso} to ${endIso} (UTC).\nEvent: ${eventId}`
     });
     await sendEmail({
-      to: hostEmail, from: FROM_EMAIL,
+      to: hostEmail, from: "service@setthetime.com",
       subject: `New booking: ${mt.title}`,
       text: `${recipient_name} <${recipient_email}> booked ${startIso}–${endIso} (UTC).\nEvent: ${eventId}`
     });
 
     return res.json({ ok: true, bookingId, eventId, start: startIso, end: endIso });
-  } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
 });
+
 
 /* =========================
    Start server
